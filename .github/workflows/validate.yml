@@ -1,0 +1,97 @@
+name: Validate release
+
+# Runs the platform smoke checks from cli/RELEASING.md on the targets that cannot be validated on a
+# Windows x64 or Linux host, and uploads one evidence record per target for
+# txlemetry-sdk/scripts/prepare-cli-platform-packages.mjs.
+
+on:
+    workflow_dispatch:
+        inputs:
+            version:
+                description: CLI version whose GitHub release assets are validated (for example, 1.0.0)
+                required: true
+                type: string
+
+permissions:
+    contents: read
+
+jobs:
+    validate:
+        name: validate (${{ matrix.target }})
+        runs-on: ${{ matrix.runner }}
+        timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: aarch64-apple-darwin
+                      runner: macos-15
+                      archive: tar.gz
+                      binary: txlemetry-cli
+                    - target: x86_64-apple-darwin
+                      runner: macos-15-intel
+                      archive: tar.gz
+                      binary: txlemetry-cli
+                    - target: aarch64-pc-windows-msvc
+                      runner: windows-11-arm
+                      archive: zip
+                      binary: txlemetry-cli.exe
+        defaults:
+            run:
+                shell: bash
+        env:
+            GH_TOKEN: ${{ github.token }}
+            VERSION: ${{ inputs.version }}
+            TARGET: ${{ matrix.target }}
+            ASSET: txlemetry-cli-${{ matrix.target }}.${{ matrix.archive }}
+            BINARY: ${{ matrix.binary }}
+        steps:
+            - uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+              with:
+                  node-version: '22'
+                  package-manager-cache: false
+
+            - name: Download release asset
+              run: |
+                  gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir "$RUNNER_TEMP/asset"
+                  mkdir -p "$RUNNER_TEMP/pkg"
+                  # Git Bash's GNU tar cannot read zip archives, so the Windows asset uses Expand-Archive.
+                  if [[ "$ASSET" == *.zip ]]; then
+                    pwsh -NoProfile -Command "Expand-Archive -LiteralPath '$RUNNER_TEMP/asset/$ASSET' -DestinationPath '$RUNNER_TEMP/pkg'"
+                  else
+                    tar -xzf "$RUNNER_TEMP/asset/$ASSET" -C "$RUNNER_TEMP/pkg"
+                  fi
+
+            - name: Run smoke checks and write evidence
+              run: |
+                  binary=$(find "$RUNNER_TEMP/pkg" -type f -name "$BINARY" | head -n 1)
+                  if [ -z "$binary" ]; then echo "::error::$BINARY not found in $ASSET"; exit 1; fi
+                  cli=failed
+                  api=failed
+                  if "$binary" --version | tee "$RUNNER_TEMP/cli-smoke.log" | grep -q "$VERSION"; then cli=passed; fi
+                  if "$binary" api --agent-help > "$RUNNER_TEMP/api-smoke.log" && [ -s "$RUNNER_TEMP/api-smoke.log" ]; then api=passed; fi
+                  head -n 3 "$RUNNER_TEMP/api-smoke.log" || true
+                  mkdir -p "$RUNNER_TEMP/evidence"
+                  node -e "
+                    const fs = require('node:fs'); const crypto = require('node:crypto');
+                    const [binary, cli, api, out] = process.argv.slice(1);
+                    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex');
+                    const passed = cli === 'passed' && api === 'passed';
+                    fs.writeFileSync(out, JSON.stringify({
+                      schemaVersion: 1, target: process.env.TARGET, version: process.env.VERSION, sha256,
+                      platformValidation: passed ? 'passed' : 'failed', cliSmoke: cli, apiSmoke: api,
+                      runtime: process.env.RUNNER_OS + ' ' + process.env.RUNNER_ARCH + ' (' + process.env.ImageOS + '), node ' + process.version,
+                      validatedAt: new Date().toISOString(),
+                      source: 'GitHub Actions run ' + process.env.GITHUB_RUN_ID + ', release asset ' + process.env.ASSET,
+                      checks: ['txlemetry-cli --version reports ' + process.env.VERSION, 'txlemetry-cli api --agent-help prints the agent guide'],
+                    }, null, 2) + '\n');
+                    console.log(process.env.TARGET + ': cli ' + cli + ', api ' + api + ', sha256 ' + sha256);
+                  " "$binary" "$cli" "$api" "$RUNNER_TEMP/evidence/$TARGET.json"
+                  if [ "$cli" != passed ] || [ "$api" != passed ]; then exit 1; fi
+
+            - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+              if: always()
+              with:
+                  name: cli-validation-${{ matrix.target }}
+                  path: ${{ runner.temp }}/evidence
+                  if-no-files-found: ignore
